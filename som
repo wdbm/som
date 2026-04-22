@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+################################################################################
+#                                                                              #
+# som                                                                          #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This program records PulseAudio/PipeWire sources, optionally in chunked      #
+# mode, with rename-on-complete chunks.                                        #
+#                                                                              #
+# copyright (C) 2026 William Breaden Madden                                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This program is free software: you can redistribute it and/or modify it      #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the License, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This program is distributed in the hope that it will be useful, but WITHOUT  #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public License, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+
+Usage:
+    som [--list] [--select] [--chunked] [--chunk-seconds=<n>] [--probe-seconds=<n>]
+    som (-h | --help)
+    som --version
+
+Options:
+    -l --list              List FFmpeg commands only (default is to run them)
+    -s --select            Interactively select a source (record even if silent)
+    --chunked              Record sequential WAV chunks (rename-on-complete)
+    --chunk-seconds=<n>    Chunk duration in seconds [default: 10]
+    --probe-seconds=<n>    Probe duration in seconds [default: 1]
+    -h --help              Show this help.
+    --version              Show version.
+
+Notes:
+    - In probe mode (default), this program uses FFmpeg to sample a short PCM
+      stream and computes the peak amplitude to decide whether a source is
+      active.
+    - In chunked mode, each chunk is written as *.wav.partial and renamed to
+      *.wav only after FFmpeg completes the chunk.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from docopt import docopt
+import os
+import re
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
+
+
+__VERSION__ = "2026-04-22T2033Z"
+
+EXIT_OK          = 0
+EXIT_NO_ACTIVE   = 1
+EXIT_USAGE       = 2
+EXIT_MISSING_DEP = 127
+
+
+def utc_timestamp_now() -> str:
+    """
+    Return a UTC timestamp string of the form YYYY-MM-DDTHHMMSSZ.
+    """
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
+def which(cmd: str) -> Optional[str]:
+    """
+    Return an executable path if cmd is available on PATH.
+    """
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(p, cmd)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def list_sources() -> List[str]:
+    """
+    Return PulseAudio/PipeWire sources from `pactl list short sources` (second
+    column).
+    """
+    out = subprocess.check_output(
+        ["pactl", "list", "short", "sources"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    sources: List[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            sources.append(parts[1])
+    return sources
+
+
+def safe_name_from_source(src: str) -> str:
+    """
+    Map a source name to a filesystem-safe token.
+    """
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", src)
+    s = s.strip("_")
+    return s if s else "source"
+
+
+def quote_command(argv: List[str]) -> str:
+    """
+    Quote an argv list as a shell-ready command string.
+    """
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def ffmpeg_pulse_input_arguments(src: str) -> List[str]:
+    """
+    Return common FFmpeg PulseAudio input arguments with stable timestamping.
+    """
+    return [
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-fflags",
+        "+genpts",
+        "-f",
+        "pulse",
+        "-i",
+        src,
+    ]
+
+
+def ffmpeg_audio_retimestamp_arguments() -> List[str]:
+    """
+    Return FFmpeg audio filter arguments that regenerate monotonic timestamps.
+    """
+    return [
+        "-af",
+        "asetpts=N/SR/TB",
+    ]
+
+
+def probe_source_peak(src: str, probe_seconds: int = 1) -> Optional[float]:
+    """
+    Probe a source by sampling s16le audio from ffmpeg and computing peak
+    amplitude.
+
+    Returns:
+        Peak in [0.0, 1.0], or None if the probe fails.
+    """
+    argv = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        *ffmpeg_pulse_input_arguments(src),
+        "-t",
+        str(probe_seconds),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "s16le",
+        "-",
+    ]
+
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=float(probe_seconds) + 2.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    data = proc.stdout
+    if not data or len(data) < 2:
+        return None
+
+    n = len(data) // 2
+    fmt = f"<{n}h"
+    try:
+        samples = struct.unpack(fmt, data[: n * 2])
+    except Exception:
+        return None
+
+    max_abs = 0
+    for s in samples:
+        a = s if s >= 0 else -s
+        if a > max_abs:
+            max_abs = a
+
+    return float(max_abs) / 32768.0
+
+
+class RecorderSupervisor:
+    """
+    Coordinate non-chunked FFmpeg processes and chunked recording threads.
+    """
+
+    def __init__(self) -> None:
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._ffmpeg_procs: List[subprocess.Popen] = []
+        self._chunk_threads: List[threading.Thread] = []
+        self._chunk_current_proc: Dict[str, subprocess.Popen] = {}
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        self._signal_all_children()
+
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _signal_all_children(self) -> None:
+        with self._lock:
+            for p in list(self._ffmpeg_procs):
+                self._signal_proc_int(p)
+            for p in list(self._chunk_current_proc.values()):
+                self._signal_proc_int(p)
+
+    @staticmethod
+    def _signal_proc_int(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+
+    def start_non_chunked(self, argv: List[str]) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=None,
+            # Keep FFmpeg out of the terminal process group so that Ctrl+C is
+            # forwarded only once by this supervisor. A double SIGINT can leave
+            # outputs empty because FFmpeg aborts before flushing the container.
+            start_new_session=True,
+        )
+        with self._lock:
+            self._ffmpeg_procs.append(proc)
+        return proc
+
+    def start_chunked_thread(
+        self,
+        src: str,
+        safe_name: str,
+        chunk_seconds: int,
+    ) -> threading.Thread:
+        t = threading.Thread(
+            target=self._chunk_loop,
+            args=(src, safe_name, chunk_seconds),
+            name=f"chunk-{safe_name}",
+            daemon=False,
+        )
+        t.start()
+        with self._lock:
+            self._chunk_threads.append(t)
+        return t
+
+    def _chunk_loop(self, src: str, safe_name: str, chunk_seconds: int) -> None:
+        counter = 1
+        current_tmp: Optional[str] = None
+
+        while not self.stop_requested():
+            chunk_ts = utc_timestamp_now()
+            out_final = f"{chunk_ts}_{safe_name}_{counter:06d}.wav"
+            out_tmp = f"{out_final}.partial"
+            current_tmp = out_tmp
+
+            argv = [
+                "ffmpeg",
+                "-v",
+                "warning",
+                "-nostdin",
+                *ffmpeg_pulse_input_arguments(src),
+                *ffmpeg_audio_retimestamp_arguments(),
+                "-t",
+                str(chunk_seconds),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "wav",
+                out_tmp,
+            ]
+
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            with self._lock:
+                self._chunk_current_proc[safe_name] = proc
+
+            while True:
+                try:
+                    proc.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.stop_requested():
+                        self._signal_proc_int(proc)
+
+            with self._lock:
+                self._chunk_current_proc.pop(safe_name, None)
+
+            if self.stop_requested():
+                if current_tmp and os.path.exists(current_tmp):
+                    try:
+                        os.remove(current_tmp)
+                    except Exception:
+                        pass
+                break
+
+            if os.path.exists(out_tmp):
+                try:
+                    os.replace(out_tmp, out_final)
+                except Exception:
+                    try:
+                        os.remove(out_tmp)
+                    except Exception:
+                        pass
+
+            counter += 1
+
+        if current_tmp and os.path.exists(current_tmp):
+            try:
+                os.remove(current_tmp)
+            except Exception:
+                pass
+
+    def wait_forever(self) -> None:
+        """
+        Wait for all known work to finish. Chunked mode runs until stopped.
+        """
+        while True:
+            with self._lock:
+                procs = list(self._ffmpeg_procs)
+                threads = list(self._chunk_threads)
+
+            any_running = any(p.poll() is None for p in procs)
+            any_threads = any(t.is_alive() for t in threads)
+
+            if not any_running and not any_threads:
+                return
+
+            time.sleep(0.25)
+
+    def join_threads(self) -> None:
+        with self._lock:
+            threads = list(self._chunk_threads)
+        for t in threads:
+            try:
+                t.join(timeout=2.0)
+            except Exception:
+                pass
+
+    def join_processes(self) -> None:
+        with self._lock:
+            procs = list(self._ffmpeg_procs)
+
+        for proc in procs:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+def write_pidfile(timestamp: str) -> Tuple[str, str]:
+    """
+    Create a pidfile and a symlink to the latest pidfile.
+
+    The pidfile includes this Python process PID and may include child PIDs.
+    """
+    pidfile = f"/tmp/som_{timestamp}.pids"
+    with open(pidfile, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()}\n")
+
+    latest = "/tmp/som_latest.pids"
+    try:
+        if os.path.islink(latest) or os.path.exists(latest):
+            os.remove(latest)
+        os.symlink(pidfile, latest)
+    except Exception:
+        pass
+
+    return pidfile, latest
+
+
+def append_pid(pidfile: str, pid: int) -> None:
+    try:
+        with open(pidfile, "a", encoding="utf-8") as f:
+            f.write(f"{pid}\n")
+    except Exception:
+        pass
+
+
+def parse_int(name: str, value: str) -> int:
+    try:
+        n = int(value)
+    except Exception:
+        raise ValueError(f"Error: {name} must be an integer.")
+    if n < 1:
+        raise ValueError(f"Error: {name} must be a positive integer.")
+    return n
+
+
+def main() -> int:
+    options = docopt(__doc__, version=__VERSION__)
+
+    do_list    = bool(options["--list"])
+    do_run     = not do_list
+    do_select  = bool(options["--select"])
+    do_chunked = bool(options["--chunked"])
+
+    try:
+        chunk_seconds = parse_int("--chunk-seconds", options["--chunk-seconds"])
+        probe_seconds = parse_int("--probe-seconds", options["--probe-seconds"])
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_USAGE
+
+    if which("pactl") is None:
+        print("Error: pactl is required.", file=sys.stderr)
+        return EXIT_MISSING_DEP
+
+    if which("ffmpeg") is None:
+        print("Error: ffmpeg is required.", file=sys.stderr)
+        return EXIT_MISSING_DEP
+
+    timestamp = utc_timestamp_now()
+
+    try:
+        sources = list_sources()
+    except subprocess.CalledProcessError:
+        print("Error: failed to list sources via pactl.", file=sys.stderr)
+        return EXIT_MISSING_DEP
+
+    if not sources:
+        print("No sources found.")
+        return EXIT_NO_ACTIVE
+
+    chosen_sources: List[str] = []
+
+    if do_select:
+        print("Available sources:")
+        for i, s in enumerate(sources, start=1):
+            print(f"{i}. {s}")
+
+        selection = input(f"Select a source (1-{len(sources)}, or q to quit): ").strip()
+        if selection == "" or selection.lower() == "q":
+            print("No selection made.")
+            return EXIT_NO_ACTIVE
+        if not selection.isdigit():
+            print(f"Invalid selection: {selection}", file=sys.stderr)
+            return EXIT_USAGE
+        idx = int(selection)
+        if idx < 1 or idx > len(sources):
+            print(f"Selection out of range: {selection}", file=sys.stderr)
+            return EXIT_USAGE
+
+        chosen_sources = [sources[idx - 1]]
+        print(f"Selected: {chosen_sources[0]}")
+    else:
+        print("Probing for active sources...")
+        for src in sources:
+            peak = probe_source_peak(src, probe_seconds=probe_seconds)
+            if peak is None:
+                continue
+            if peak > 0.0:
+                chosen_sources.append(src)
+                print(f"ACTIVE: {src} (level {peak:.6f})")
+
+    if not chosen_sources:
+        print("No active sources found.")
+        return EXIT_NO_ACTIVE
+
+    supervisor = RecorderSupervisor()
+
+    def handle_signal(_signum: int, _frame) -> None:
+        print("Stopping recordings...")
+        supervisor.request_stop()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    pidfile = ""
+    if do_run:
+        try:
+            pidfile, _latest = write_pidfile(timestamp)
+        except Exception:
+            pidfile = ""
+
+    for src in chosen_sources:
+        safe_name = safe_name_from_source(src)
+
+        if do_chunked:
+            if do_run:
+                print(f"Starting chunked recording from {src} (chunk {chunk_seconds}s, rename-on-complete)")
+            else:
+                print(f"Prepared chunked recording from {src} (chunk {chunk_seconds}s, rename-on-complete)")
+
+            print("---------------------------------------------------------------")
+            print("command (repeated per chunk):")
+            print(
+                "  "
+                + quote_command(
+                    [
+                        "ffmpeg",
+                        "-use_wallclock_as_timestamps",
+                        "1",
+                        "-fflags",
+                        "+genpts",
+                        "-nostdin",
+                        "-f",
+                        "pulse",
+                        "-i",
+                        src,
+                        "-af",
+                        "asetpts=N/SR/TB",
+                        "-t",
+                        str(chunk_seconds),
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-c:a",
+                        "pcm_s16le",
+                        "-f",
+                        "wav",
+                        "<chunk>.wav.partial",
+                    ]
+                )
+            )
+            print("  mv <chunk>.wav.partial <chunk>.wav")
+            print("---------------------------------------------------------------")
+
+            if do_run:
+                supervisor.start_chunked_thread(src, safe_name, chunk_seconds)
+        else:
+            outfile = f"{timestamp}_{safe_name}.ogg"
+            if do_run:
+                print(f"Starting recording from {src} -> {outfile}")
+            else:
+                print(f"Prepared recording from {src} -> {outfile}")
+
+            cmd = [
+                "ffmpeg",
+                "-v",
+                "warning",
+                "-nostdin",
+                *ffmpeg_pulse_input_arguments(src),
+                *ffmpeg_audio_retimestamp_arguments(),
+                outfile,
+            ]
+
+            print("---------------------------------------------------------------")
+            print(f"command: {quote_command(cmd)} &")
+            print("---------------------------------------------------------------")
+
+            if do_run:
+                proc = supervisor.start_non_chunked(cmd)
+                if pidfile:
+                    append_pid(pidfile, int(proc.pid))
+
+    if do_run:
+        if pidfile:
+            print(f"PID file: {pidfile}")
+        print("Recording. Press Ctrl+C to stop cleanly.")
+        try:
+            supervisor.wait_forever()
+        finally:
+            supervisor.request_stop()
+            supervisor.join_processes()
+            supervisor.join_threads()
+        print("All recordings stopped.")
+    else:
+        print("List mode only.")
+
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
